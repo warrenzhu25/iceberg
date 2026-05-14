@@ -84,6 +84,38 @@ The format specification in `format/spec.md` is the behavioral contract. Java cl
 
 `TableOperations` is the core abstraction for loading current metadata and committing new metadata. It lives in `core/src/main/java/org/apache/iceberg/TableOperations.java`. Implementations include metastore-backed operations, REST-backed operations, Hadoop-style operations, and backend-specific variants.
 
+## 4.1 Core Implementation Map
+
+The most useful way to read `core` is to follow object ownership:
+
+```mermaid
+flowchart TD
+  Catalog[Catalog implementation] --> Ops[TableOperations]
+  Ops --> BaseTable[BaseTable]
+  BaseTable --> ScanFactory[newScan/newIncrementalScan]
+  BaseTable --> UpdateFactory[newAppend/newOverwrite/newRowDelta/etc]
+  ScanFactory --> SnapshotScan[SnapshotScan/BaseTableScan]
+  UpdateFactory --> SnapshotProducer[SnapshotProducer subclasses]
+  SnapshotProducer --> TableMetadataBuilder[TableMetadata.Builder]
+  TableMetadataBuilder --> OpsCommit[TableOperations.commit]
+```
+
+`BaseTable` is intentionally thin. It stores a `TableOperations`, a table name, and a metrics reporter. Its read methods, such as `schema()`, `spec()`, `currentSnapshot()`, and `properties()`, delegate to `ops.current()`. Its mutation methods are factories: `newAppend()` returns `MergeAppend`, `newFastAppend()` returns `FastAppend`, `newOverwrite()` returns `BaseOverwriteFiles`, `newRowDelta()` returns `BaseRowDelta`, `newRewrite()` returns `BaseRewriteFiles`, and so on.
+
+`TableOperations` is the important state boundary. It exposes:
+
+- `current()`: return loaded metadata without checking for updates.
+- `refresh()`: reload current table metadata from the backend.
+- `commit(base, metadata)`: atomically replace base metadata with new metadata.
+- `io()`: return the `FileIO` used for table data and metadata files.
+- `metadataFileLocation(fileName)`: choose where a new metadata file should be written.
+- `locationProvider()`: choose locations for new data files.
+- `newSnapshotId()`: allocate snapshot IDs.
+
+The contract for `commit` is stricter than it first appears. Implementations must check that the supplied `base` is still current before publishing `metadata`. If the implementation cannot determine whether a commit succeeded, it must throw `CommitStateUnknownException`, because cleanup decisions depend on knowing whether newly written files are safe to delete.
+
+`BaseMetastoreTableOperations` shows the common metastore-backed pattern. It caches `currentMetadata`, `currentMetadataLocation`, a metadata `version`, and a `shouldRefresh` flag. `current()` refreshes if needed. `commit(base, metadata)` rejects stale metadata, returns early for no-op commits, calls backend-specific `doCommit`, deletes removed metadata files, and marks the table for refresh. Subclasses provide `doRefresh()` and `doCommit()`.
+
 ## 5. Deep Dive By Major Module
 
 ### `api`
@@ -253,6 +285,17 @@ flowchart TD
 
 A scan starts from `TableScan`, usually implemented through `BaseTableScan` and `SnapshotScan`. Filters and projections are bound to the table schema. Iceberg chooses a snapshot, reads manifests, prunes files using partition and metrics information, and produces scan tasks. Engine modules convert those tasks into Spark partitions, Flink splits, MapReduce splits, or connector-specific work.
 
+Implementation detail:
+
+- `BaseTable.newScan()` creates a `DataTableScan` with the table schema and an immutable scan context.
+- `SnapshotScan.planFiles()` resolves the target snapshot. Without an explicit snapshot ID, it uses `table().currentSnapshot()`.
+- Time travel is handled by `useSnapshot`, `useRef`, and `asOfTime`. These refine the scan context instead of mutating the original scan.
+- `SnapshotScan.planFiles()` emits a `ScanEvent`, starts scan metrics, calls `doPlanFiles()`, and reports a `ScanReport` when the returned iterable is closed.
+- `BaseTableScan.planTasks()` splits `FileScanTask`s using `TableScanUtil.splitFiles` and combines them using `TableScanUtil.planTasks`.
+- Concrete scan classes own manifest reading and data/delete file task production. The base classes own lifecycle, context, metrics, and snapshot selection.
+
+The key distinction is `planFiles()` versus `planTasks()`. `planFiles()` produces file-level work. `planTasks()` turns that work into combined tasks sized for execution, using target split size, split lookback, and open-file cost.
+
 ### Write and Commit Flow
 
 ```mermaid
@@ -276,6 +319,20 @@ sequenceDiagram
 
 Writers produce physical data/delete files first. Snapshot updates then create manifests and a new metadata file. `TableOperations.commit` attempts to atomically swap the table from the base metadata to the new metadata. If another writer committed first, validation or commit conflict handling determines whether to retry or fail.
 
+The common snapshot-producing path is implemented by `SnapshotProducer`:
+
+1. The operation captures `ops.current()` as its base metadata.
+2. `commit()` runs with retry settings from table properties such as `commit.num-retries`, `commit.min-retry-wait-ms`, `commit.max-retry-wait-ms`, and `commit.total-retry-time-ms`.
+3. Each attempt calls `apply()`.
+4. `apply()` refreshes metadata, finds the parent snapshot for the target branch, validates the current table state, and asks the subclass to produce manifest files through `apply(base, parentSnapshot)`.
+5. `SnapshotProducer` writes a manifest list file, builds a `BaseSnapshot`, and prepares snapshot summary totals.
+6. `commit()` builds updated `TableMetadata` from the refreshed base. It either adds a staged snapshot or sets the target branch snapshot.
+7. `TableOperations.commit(base, updated.withUUID())` publishes the metadata.
+8. After success, uncommitted manifests and extra manifest lists from failed attempts are cleaned up.
+9. Listeners and metrics reporters are notified after the commit.
+
+Different update classes customize the operation by implementing `operation()`, `validate(...)`, `apply(...)`, `summary()`, and cleanup. For example, append, overwrite, row delta, rewrite, and replace-partitions operations share the same outer commit lifecycle but differ in validation and manifest construction.
+
 ### REST Catalog Flow
 
 ```mermaid
@@ -297,6 +354,17 @@ sequenceDiagram
 
 REST code handles request/response models, auth, retry, error mapping, and serialization. The client-side catalog still returns Iceberg `Table` abstractions; REST primarily changes how metadata is loaded and committed.
 
+`RESTTableOperations` implements the same `TableOperations` contract but sends metadata changes to a REST server:
+
+- `refresh()` checks the `V1_LOAD_TABLE` endpoint and fetches a `LoadTableResponse`.
+- `commit(base, metadata)` checks `V1_UPDATE_TABLE`, derives `MetadataUpdate` entries from `metadata.changes()`, and derives `UpdateRequirement`s from the update type.
+- Create, replace, and simple updates use different requirement builders: `forCreateTable`, `forReplaceTable`, and `forUpdateTable`.
+- The request is serialized as `UpdateTableRequest` and posted through `RESTClient`.
+- The response updates the local current metadata.
+- On `CommitStateUnknownException`, simple snapshot-add-only updates attempt lightweight reconciliation by refreshing and checking whether the expected snapshot exists.
+
+This is a useful contrast with metastore operations. Metastore implementations usually write a metadata file then atomically update a metadata location in the backing catalog. REST operations send logical metadata updates and requirements to a server that owns the final commit decision.
+
 ## 7. Catalog and Metadata Layer
 
 `Catalog` is the user-facing namespace/table registry abstraction. `Table` is the logical table API. `TableOperations` is the internal implementation boundary that loads current metadata and commits replacements.
@@ -315,6 +383,26 @@ The optimistic concurrency model is visible in the shape of `TableOperations.com
 
 REST-backed operations differ because table metadata load and commit travel through serialized REST request/response models. Auth and TLS behavior live under `core/src/main/java/org/apache/iceberg/rest/auth`; request and response types live under `rest/requests` and `rest/responses`; HTTP retry/error behavior is in the REST client classes.
 
+### Metadata Commit Mechanics
+
+For metastore-backed implementations, the usual commit shape is:
+
+1. Validate that the caller's base metadata object is still the current metadata object.
+2. Write the new table metadata JSON to a unique file under the table metadata location.
+3. Atomically update the backend's pointer from the old metadata location to the new metadata location.
+4. Mark local state as needing refresh.
+5. Clean up old metadata files according to table properties and cleanup rules.
+
+`BaseMetastoreTableOperations.writeNewMetadata()` writes through `TableMetadataParser.overwrite`. The comment in that method explains why overwrite is used for a unique metadata path: it avoids negative caching problems in S3 while remaining safe because metadata filenames include unique UUID material.
+
+The table UUID check in `refreshFromMetadataLocation` prevents accidentally refreshing one table object with another table's metadata. If both old and new metadata have UUIDs, they must match.
+
+### Snapshot Update Mechanics
+
+Most table-modifying operations eventually produce `MetadataUpdate` entries. Those entries describe logical changes to table metadata: adding schemas, setting current schema, adding snapshots, setting refs, updating properties, and similar changes. REST commits transmit these updates directly. Local/metastore commits materialize a replacement `TableMetadata` object and publish its file location.
+
+Branch handling is built into `SnapshotProducer`. The default target is `main`. `toBranch` changes the target branch, and `stageOnly` adds the snapshot without advancing the branch head. Write-audit-publish in Spark uses this staged snapshot behavior.
+
 ## 8. Engine Integration Strategy
 
 Engine modules are adapters, not owners of table semantics. They translate engine-specific APIs into Iceberg table operations.
@@ -329,6 +417,54 @@ Kafka Connect owns Kafka connector lifecycle, task coordination, record conversi
 
 Versioned Spark and Flink modules should be read as parallel implementations against different host API versions. When changing shared behavior, check the same class families across versions.
 
+### Spark Write Path Details
+
+Spark 3.5 write behavior is centered on `spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkWrite.java`.
+
+`SparkWrite` implements Spark's `Write` and `RequiresDistributionAndOrdering`. It computes the required distribution, ordering, advisory partition size, data file format, output partition spec, target data file size, write schema, and snapshot metadata from `SparkWriteConf` and `SparkWriteRequirements`.
+
+The executor-facing writer factory broadcasts a serializable copy of the Iceberg table:
+
+- `createWriterFactory()` broadcasts `SerializableTableWithSize.copyOf(table)`.
+- Each Spark task writes records into Iceberg `DataFile`s through a `DataWriter`.
+- Task outputs are returned as `TaskCommit` messages.
+- Driver-side commit code converts those messages into `DataFileSet`s and commits through Iceberg table update APIs.
+
+Spark write modes map to Iceberg operations:
+
+- Batch append: `table.newAppend()`, then `append.appendFile(file)`.
+- Dynamic overwrite: `table.newReplacePartitions()`, with optional conflict validation.
+- Overwrite by filter: `table.newOverwrite().overwriteByRowFilter(expr)`.
+- Copy-on-write row-level operations: `table.newOverwrite()`, delete overwritten files, add replacement files, and validate conflicts according to `SERIALIZABLE` or `SNAPSHOT` isolation.
+- Streaming append: `table.newFastAppend()`, with query ID and epoch ID written into snapshot summary metadata.
+- Streaming complete overwrite: overwrite semantics with epoch tracking.
+
+`commitOperation` is the common driver-side commit wrapper. It adds Spark app ID, extra snapshot metadata, thread-local commit properties, WAP metadata, and branch targeting before calling `operation.commit()`. If a commit fails with a cleanable failure, abort cleanup deletes files produced by the job.
+
+Spark streaming idempotency is snapshot-summary based. Before committing an epoch, `BaseStreamingWrite.commit` refreshes the table and walks snapshot ancestors looking for the same query ID. If it finds a committed epoch greater than or equal to the current one, it skips the commit.
+
+### Flink Sink Path Details
+
+Flink streaming writes split responsibility between writers and a committer:
+
+- `IcebergStreamWriter` is a stream operator that owns a `TaskWriter`.
+- On each record, `processElement` calls `writer.write`.
+- On checkpoint barrier, `prepareSnapshotPreBarrier` calls `flush(checkpointId)`.
+- `flush` completes the current writer, emits a `FlinkWriteResult`, and creates a fresh writer.
+- `IcebergFilesCommitter` receives those results, stores them by checkpoint, and commits when Flink reports checkpoint completion.
+
+`IcebergFilesCommitter` maintains a sorted map from checkpoint ID to serialized delta manifests. This is important for fault tolerance: if checkpoint 1 writes files but its snapshot fails, and checkpoint 2 later succeeds, the committer can commit all pending files up to checkpoint 2. It stores this pending state in Flink operator state.
+
+On restore, the committer reloads the table through `TableLoader`, restores the previous Flink job ID from state, finds the max committed checkpoint ID from Iceberg snapshot metadata, and commits any restored uncommitted files whose checkpoint ID is newer.
+
+Commit behavior depends on mode:
+
+- Replace-partitions mode creates a `ReplacePartitions` operation.
+- Normal delta mode creates append/row-delta style updates depending on the pending write results.
+- Empty checkpoints are skipped until `flink.max-continuous-empty-commits` is reached, which bounds metadata heartbeat behavior.
+
+Flink's correctness boundary is therefore two-layered: Flink checkpoint state preserves pending files, and Iceberg snapshot metadata records max committed checkpoint information to avoid duplicate commits after recovery.
+
 ## 9. Storage, File Formats, and IO
 
 Iceberg separates logical table metadata from physical file access. `FileIO`, `InputFile`, and `OutputFile` are public IO abstractions in `api/src/main/java/org/apache/iceberg/io`. Cloud modules and Hadoop/local implementations provide concrete access to object stores or filesystems.
@@ -340,6 +476,18 @@ File format modules handle data-file concerns:
 - `arrow`: Arrow vectors and batch abstractions used by vectorized readers and engine integration.
 
 Metadata files use Iceberg-specific JSON and Avro structures. Table metadata JSON is handled by `TableMetadataParser`; manifests and manifest lists are handled in core metadata/Avro code. Data files and delete files are stored in Parquet/ORC/Avro depending on table configuration and writer path.
+
+### File Creation and Location Responsibilities
+
+`TableOperations.locationProvider()` supplies data file locations. Writers generally do not invent table layout rules directly; they ask Iceberg location providers and output factories. For example, Spark write code uses Iceberg writer factories and output file factories to produce data files under the configured table layout.
+
+Metadata file locations are separate from data file locations. `TableOperations.metadataFileLocation(fileName)` controls metadata placement, and metastore operations default to a `metadata` directory unless table properties override the write metadata location.
+
+The practical consequence is that storage changes often need to be checked in three places:
+
+- `FileIO` behavior for opening, writing, deleting, and credential use.
+- `LocationProvider` behavior for data file paths.
+- `TableOperations` behavior for metadata file paths and commit publication.
 
 ## 10. Cross-Cutting Concerns
 
