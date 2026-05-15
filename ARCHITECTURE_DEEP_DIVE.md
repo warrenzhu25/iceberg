@@ -187,6 +187,317 @@ V2 introduced sequence numbers to order writes. A delete file only applies to da
 
 The sequence number is assigned at commit time and stored in the manifest entry.
 
+### Manifest Entry Structure
+
+Each entry in a manifest file wraps a `DataFile` or `DeleteFile` with tracking metadata:
+
+```java
+// ManifestEntry fields (core/src/main/java/org/apache/iceberg/ManifestEntry.java)
+interface ManifestEntry<F extends ContentFile<F>> {
+  enum Status { EXISTING(0), ADDED(1), DELETED(2) }
+
+  Status status();           // Entry state in this manifest
+  Long snapshotId();         // Snapshot that added this file
+  Long dataSequenceNumber(); // Sequence number for delete ordering
+  Long fileSequenceNumber(); // Sequence number when file was added
+  F file();                  // The actual DataFile or DeleteFile
+}
+```
+
+The `status` field tracks file lifecycle:
+- `ADDED`: File was added in this snapshot.
+- `EXISTING`: File existed before and is carried forward.
+- `DELETED`: File is marked for removal (tombstone).
+
+Manifest merging compacts manifests by dropping `DELETED` entries and converting `ADDED` entries to `EXISTING` when rewriting.
+
+### DataFile Field IDs and Metrics
+
+`DataFile` (`api/src/main/java/org/apache/iceberg/DataFile.java`) stores extensive metadata for pruning:
+
+| Field ID | Name | Purpose |
+|----------|------|---------|
+| 100 | file_path | File location URI |
+| 101 | file_format | parquet/orc/avro |
+| 102 | partition | Partition tuple values |
+| 103 | record_count | Row count for planning |
+| 104 | file_size_in_bytes | For cost estimation |
+| 108 | column_sizes | Per-column bytes |
+| 109 | value_counts | Non-null counts per column |
+| 110 | null_value_counts | Null counts per column |
+| 125 | lower_bounds | Min values per column |
+| 128 | upper_bounds | Max values per column |
+| 132 | split_offsets | Row group boundaries |
+| 140 | sort_order_id | Clustering info |
+
+These column-level statistics enable **metrics pruning**: skipping files where filter predicates cannot match based on min/max bounds.
+
+### MergingSnapshotProducer Internals
+
+Most write operations extend `MergingSnapshotProducer` (`core/src/main/java/org/apache/iceberg/MergingSnapshotProducer.java`), which provides:
+
+**Manifest Management**:
+- `ManifestMergeManager`: Combines small manifests to meet target size (`manifest.target-size-bytes`).
+- `ManifestFilterManager`: Applies deletions and rewrites manifests.
+- Separate managers for data files and delete files.
+
+**File Tracking**:
+```java
+// New files added in this operation
+private final Map<Integer, DataFileSet> newDataFilesBySpec;
+private final Map<Integer, DeleteFileSet> newDeleteFilesBySpec;
+
+// Files to delete
+private Expression deleteExpression;  // Row filter for deletes
+
+// Manifests to append
+private final List<ManifestFile> appendManifests;
+```
+
+**Conflict Validation Operations**:
+```java
+// Validation checks in MergingSnapshotProducer
+static final Set<String> VALIDATE_ADDED_FILES_OPERATIONS =
+    ImmutableSet.of(DataOperations.APPEND, DataOperations.OVERWRITE);
+static final Set<String> VALIDATE_DATA_FILES_EXIST_OPERATIONS =
+    ImmutableSet.of(DataOperations.OVERWRITE, DataOperations.REPLACE, DataOperations.DELETE);
+static final Set<String> VALIDATE_ADDED_DELETE_FILES_OPERATIONS =
+    ImmutableSet.of(DataOperations.OVERWRITE, DataOperations.DELETE);
+```
+
+## 4.3 Expression System
+
+Iceberg's expression system enables filter pushdown from engines to scan planning and file formats.
+
+### Expression Types
+
+All expressions are in `api/src/main/java/org/apache/iceberg/expressions/`:
+
+| Type | Example | Use Case |
+|------|---------|----------|
+| `And` / `Or` / `Not` | `and(eq("a", 1), gt("b", 2))` | Combining predicates |
+| `UnboundPredicate` | `equal("col", value)` | Before binding to schema |
+| `BoundPredicate` | After `bind(schema)` | Ready for evaluation |
+| `UnboundTerm` | `bucket("id", 16)` | Transform expressions |
+
+**Expression Lifecycle**:
+```
+Unbound Expression → bind(schema) → Bound Expression → evaluate(row)
+```
+
+### Projections and Residuals
+
+`Projections` transforms row-level expressions into partition-level expressions:
+
+```java
+// Example: row filter "date = '2024-01-15'" on table partitioned by day(timestamp)
+Expression rowFilter = Expressions.equal("date", "2024-01-15");
+
+// Project to partition filter
+Expression partitionFilter = Projections.inclusive(spec).project(rowFilter);
+// Result: day(timestamp) = days_since_epoch("2024-01-15")
+```
+
+**Inclusive vs Strict Projections**:
+- `Projections.inclusive()`: May include extra rows (for partition pruning).
+- `Projections.strict()`: Only matches if all rows match (for file metrics pruning).
+
+**ResidualEvaluator**: After partition pruning, computes the remaining predicate to apply at read time.
+
+### ManifestEvaluator
+
+`ManifestEvaluator` decides whether a manifest might contain matching files:
+
+```java
+ManifestEvaluator evaluator = ManifestEvaluator.forRowFilter(
+    rowFilter, spec, caseSensitive);
+
+for (ManifestFile manifest : snapshot.manifests()) {
+  if (evaluator.eval(manifest)) {
+    // Manifest might have matching files, must scan it
+  } else {
+    // Skip entire manifest
+  }
+}
+```
+
+Uses manifest-level partition summaries (min/max per partition field across all entries).
+
+## 4.4 Scan Planning Internals
+
+The scan planner transforms a filter expression into a set of file tasks.
+
+### ManifestGroup
+
+`ManifestGroup` (`core/src/main/java/org/apache/iceberg/ManifestGroup.java`) orchestrates scan planning:
+
+```mermaid
+flowchart TD
+  Manifests[All Manifests] --> ManifestPrune[Manifest Pruning\nManifestEvaluator]
+  ManifestPrune --> ManifestRead[Read Matching Manifests]
+  ManifestRead --> PartitionPrune[Partition Pruning\nEvaluator on partition]
+  PartitionPrune --> MetricsPrune[Metrics Pruning\nInclusiveMetricsEvaluator]
+  MetricsPrune --> DeleteIndex[Build DeleteFileIndex]
+  DeleteIndex --> Tasks[FileScanTasks with delete files]
+```
+
+**ManifestGroup Configuration**:
+```java
+ManifestGroup group = new ManifestGroup(io, dataManifests, deleteManifests)
+    .specsById(specsById)
+    .filterData(rowFilter)              // Row-level filter
+    .filterPartitions(partitionFilter)  // Partition-level filter
+    .caseSensitive(true)
+    .planWith(executorService);         // Parallel manifest reading
+```
+
+### DeleteFileIndex
+
+`DeleteFileIndex` (`core/src/main/java/org/apache/iceberg/DeleteFileIndex.java`) maps data files to applicable delete files:
+
+```java
+class DeleteFileIndex {
+  // Global equality deletes (apply to all partitions)
+  private final EqualityDeletes globalDeletes;
+
+  // Equality deletes by partition
+  private final PartitionMap<EqualityDeletes> eqDeletesByPartition;
+
+  // Position deletes by partition
+  private final PartitionMap<PositionDeletes> posDeletesByPartition;
+
+  // Position deletes by exact file path (for DVs)
+  private final Map<String, PositionDeletes> posDeletesByPath;
+
+  // Deletion vectors by data file path
+  private final Map<String, DeleteFile> dvByPath;
+}
+```
+
+**Delete Matching Algorithm**:
+1. Find equality deletes that apply (global + partition-scoped, sequence number check).
+2. Find position deletes that apply (partition-scoped, sequence number check).
+3. Find DVs that reference this data file path.
+4. Return combined delete files for the reader to apply.
+
+### Incremental Scans
+
+`IncrementalDataTableScan` (`core/src/main/java/org/apache/iceberg/IncrementalDataTableScan.java`) reads only new data between snapshots:
+
+```java
+// Read data added between two snapshots
+table.newScan()
+    .appendsBetween(fromSnapshotId, toSnapshotId)
+    .planFiles();
+
+// Read data added after a snapshot
+table.newScan()
+    .appendsAfter(fromSnapshotId)
+    .planFiles();
+```
+
+This enables CDC-style streaming: track last processed snapshot, read only new appends.
+
+**Implementation**: Walks snapshot history from `fromSnapshot` to `toSnapshot`, collects manifests from `APPEND` operations, filters to `ADDED` entries only.
+
+## 4.5 Conflict Detection and Validation
+
+Concurrent write correctness depends on validation at commit time.
+
+### Isolation Levels
+
+Iceberg supports two isolation levels configured per operation:
+
+| Level | Behavior | Use Case |
+|-------|----------|----------|
+| `SNAPSHOT` | Validate against read snapshot | Default for most operations |
+| `SERIALIZABLE` | Validate against all concurrent changes | Required for UPDATE/MERGE correctness |
+
+### Validation Methods
+
+`BaseRowDelta` shows the validation pattern:
+
+```java
+@Override
+protected void validate(TableMetadata base, Snapshot parent) {
+  if (parent != null) {
+    // 1. Validate starting snapshot is ancestor
+    if (startingSnapshotId != null) {
+      Preconditions.checkArgument(
+          SnapshotUtil.isAncestorOf(parent.snapshotId(), startingSnapshotId, base::snapshot));
+    }
+
+    // 2. Validate referenced data files still exist
+    if (!referencedDataFiles.isEmpty()) {
+      validateDataFilesExist(base, startingSnapshotId, referencedDataFiles, ...);
+    }
+
+    // 3. Validate no conflicting data files added
+    if (validateNewDataFiles) {
+      validateAddedDataFiles(base, startingSnapshotId, conflictDetectionFilter, parent);
+    }
+
+    // 4. Validate no conflicting delete files added
+    if (validateNewDeleteFiles) {
+      validateNoNewDeleteFiles(base, startingSnapshotId, conflictDetectionFilter, parent);
+    }
+
+    // 5. Validate DVs don't conflict
+    validateAddedDVs(base, startingSnapshotId, conflictDetectionFilter, parent);
+  }
+}
+```
+
+### Conflict Detection Filter
+
+The conflict detection filter scopes validation to relevant rows:
+
+```java
+// Only validate conflicts for rows matching this filter
+rowDelta
+    .conflictDetectionFilter(Expressions.equal("region", "us-west"))
+    .validateNoConflictingDataFiles()
+    .validateNoConflictingDeleteFiles();
+```
+
+Files are checked for conflicts only if their partition statistics might overlap with the filter. This allows concurrent operations on different partitions.
+
+## 4.6 Transaction Support
+
+`Transaction` (`api/src/main/java/org/apache/iceberg/Transaction.java`) groups multiple operations into a single atomic commit:
+
+```java
+Transaction txn = table.newTransaction();
+
+// Multiple operations share the transaction
+txn.updateSchema()
+    .addColumn("new_col", Types.StringType.get())
+    .commit();
+
+txn.newAppend()
+    .appendFile(dataFile)
+    .commit();
+
+txn.updateProperties()
+    .set("key", "value")
+    .commit();
+
+// Single atomic commit of all changes
+txn.commitTransaction();
+```
+
+**Implementation** (`core/src/main/java/org/apache/iceberg/BaseTransaction.java`):
+- Creates a `TransactionTable` that buffers operations.
+- Each operation updates an in-memory `TableMetadata`.
+- `commitTransaction()` writes final metadata and commits atomically.
+- Validates that base metadata hasn't changed since transaction start.
+
+**Transaction Types**:
+- `CREATE_TABLE`: Create new table with initial metadata.
+- `REPLACE_TABLE`: Replace table atomically.
+- `CREATE_OR_REPLACE`: Create or replace as atomic unit.
+- `SIMPLE`: Default for multi-operation transactions.
+
 ## 5. Deep Dive By Major Module
 
 ### `api`
@@ -656,6 +967,119 @@ File format modules handle data-file concerns:
 
 Metadata files use Iceberg-specific JSON and Avro structures. Table metadata JSON is handled by `TableMetadataParser`; manifests and manifest lists are handled in core metadata/Avro code. Data files and delete files are stored in Parquet/ORC/Avro depending on table configuration and writer path.
 
+### Parquet Integration Details
+
+The `parquet` module provides deep integration with Apache Parquet:
+
+**Schema Conversion** (`parquet/src/main/java/org/apache/iceberg/parquet/ParquetSchemaUtil.java`):
+```java
+// Iceberg schema → Parquet MessageType
+MessageType parquetSchema = ParquetSchemaUtil.convert(icebergSchema, "table");
+
+// Parquet → Iceberg (for schema inference)
+Schema icebergSchema = ParquetSchemaUtil.convert(parquetSchema);
+```
+
+**Filter Pushdown** (`parquet/src/main/java/org/apache/iceberg/parquet/ParquetFilters.java`):
+Iceberg expressions are converted to Parquet `FilterPredicate`:
+```java
+FilterPredicate parquetFilter = ParquetFilters.convert(
+    schema, expression, caseSensitive);
+```
+
+Parquet then uses these predicates for:
+- Row group skipping (using column statistics)
+- Page skipping (using page indexes, if available)
+- Dictionary filtering
+
+**Vectorized Reading** (`parquet/src/main/java/org/apache/iceberg/parquet/VectorizedParquetReader.java`):
+For engine integration, Iceberg provides vectorized batch readers that work with columnar formats:
+```java
+CloseableIterable<ColumnarBatch> reader = Parquet.read(inputFile)
+    .project(schema)
+    .filter(filter)
+    .createBatchedReaderFunc(fileSchema ->
+        VectorizedSparkParquetReaders.buildReader(schema, fileSchema, ...))
+    .build();
+```
+
+**Metrics Collection**:
+When writing Parquet files, Iceberg collects column-level metrics:
+- Min/max values per column (for metrics pruning)
+- Null counts
+- Value counts
+- Column sizes
+
+### ORC Integration
+
+ORC integration follows a similar pattern:
+
+**Schema Conversion** (`orc/src/main/java/org/apache/iceberg/orc/ORCSchemaUtil.java`):
+```java
+TypeDescription orcSchema = ORCSchemaUtil.convert(icebergSchema);
+Schema icebergSchema = ORCSchemaUtil.convert(orcSchema);
+```
+
+**Filter Pushdown**: ORC supports search arguments (SArg) for predicate pushdown:
+```java
+SearchArgument sarg = OrcFilters.convert(expression, schema);
+```
+
+**Vectorized Reading**: ORC has native vectorized batch support through `VectorizedRowBatch`.
+
+### Reader and Writer Factory Pattern
+
+Iceberg uses a factory pattern for format-agnostic reading and writing:
+
+**Reading** (`data/src/main/java/org/apache/iceberg/data/`):
+```java
+CloseableIterable<Record> reader = IcebergGenerics.read(table)
+    .where(filter)
+    .select(columns)
+    .build();
+```
+
+Internally, this uses format-specific readers:
+```java
+// For Parquet
+Parquet.read(file)
+    .project(schema)
+    .filter(residual)
+    .createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(schema, fileSchema))
+    .build();
+
+// For ORC
+ORC.read(file)
+    .project(schema)
+    .filter(residual)
+    .createReaderFunc(fileSchema -> GenericOrcReaders.buildReader(schema, fileSchema))
+    .build();
+```
+
+**Writing** (`data/src/main/java/org/apache/iceberg/data/`):
+```java
+FileAppender<Record> appender = Parquet.write(outputFile)
+    .schema(schema)
+    .createWriterFunc(GenericParquetWriter::buildWriter)
+    .build();
+
+for (Record record : records) {
+    appender.add(record);
+}
+appender.close();
+```
+
+### Delete File Formats
+
+Position delete files use a fixed schema:
+```
+file_path: string (required)
+pos: long (required)
+row: struct (optional, for debugging)
+```
+
+Equality delete files use a subset of the table schema containing only the equality field columns.
+
 ### File Creation and Location Responsibilities
 
 `TableOperations.locationProvider()` supplies data file locations. Writers generally do not invent table layout rules directly; they ask Iceberg location providers and output factories. For example, Spark write code uses Iceberg writer factories and output file factories to produce data files under the configured table layout.
@@ -681,6 +1105,78 @@ Compatibility is a major constraint. `build.gradle` applies RevAPI checks to pub
 Testing is distributed by module. The root README notes Docker/Testcontainers requirements for some tests. Large changes should run focused module tests first, then broader Gradle checks when practical.
 
 Generated or bundled artifacts include runtime/bundle modules for dependency shading, OpenAPI-generated or OpenAPI-related artifacts, and version-specific engine runtime jars.
+
+### Key Table Properties Reference
+
+Table properties control behavior across all operations. Key properties by category:
+
+**Commit Behavior** (`core/src/main/java/org/apache/iceberg/TableProperties.java`):
+
+| Property | Default | Purpose |
+|----------|---------|---------|
+| `commit.num-retries` | 4 | Retry count on commit conflict |
+| `commit.min-retry-wait-ms` | 100 | Minimum wait between retries |
+| `commit.max-retry-wait-ms` | 60000 | Maximum wait between retries |
+| `commit.total-retry-time-ms` | 1800000 | Total retry time budget (30 min) |
+| `commit.manifest-merge.enabled` | true | Merge small manifests on commit |
+
+**Manifest Management**:
+
+| Property | Default | Purpose |
+|----------|---------|---------|
+| `manifest.target-size-bytes` | 8388608 (8MB) | Target manifest file size |
+| `manifest.min-merge-count` | 100 | Min manifests before merging |
+
+**Write Settings**:
+
+| Property | Default | Purpose |
+|----------|---------|---------|
+| `write.target-file-size-bytes` | 536870912 (512MB) | Target data file size |
+| `write.distribution-mode` | `none` | Data distribution (none/hash/range) |
+| `write.delete.distribution-mode` | `hash` | Delete distribution mode |
+| `write.format.default` | `parquet` | Default file format |
+| `write.parquet.compression-codec` | `zstd` | Parquet compression |
+
+**Read Settings**:
+
+| Property | Default | Purpose |
+|----------|---------|---------|
+| `read.split.target-size` | 134217728 (128MB) | Target split size for readers |
+| `read.split.open-file-cost` | 4194304 (4MB) | Estimated cost to open a file |
+| `read.split.metadata-columns` | - | Include metadata columns in splits |
+
+**Snapshot Management**:
+
+| Property | Default | Purpose |
+|----------|---------|---------|
+| `history.expire.max-snapshot-age-ms` | 432000000 (5 days) | Max snapshot age |
+| `history.expire.min-snapshots-to-keep` | 1 | Minimum snapshots to retain |
+| `history.expire.max-ref-age-ms` | - | Max age for branch/tag refs |
+
+**Format Version**:
+
+| Property | Default | Purpose |
+|----------|---------|---------|
+| `format-version` | 2 | Iceberg format version (1, 2, or 3) |
+
+### Metrics Collection
+
+Iceberg collects metrics at multiple levels:
+
+**Scan Metrics** (`api/src/main/java/org/apache/iceberg/metrics/ScanMetrics.java`):
+- `total-planning-duration`: Time to plan scan
+- `result-data-files`: Number of data files in plan
+- `result-delete-files`: Number of delete files
+- `skipped-data-files`: Files skipped by pruning
+- `scanned-data-manifests`: Manifests read during planning
+
+**Commit Metrics** (`api/src/main/java/org/apache/iceberg/metrics/CommitMetrics.java`):
+- `total-duration`: Total commit time
+- `attempts`: Number of commit attempts
+- `added-data-files`: Files added in commit
+- `added-delete-files`: Delete files added
+
+Metrics are reported through `MetricsReporter` implementations. Engine modules typically integrate with their native metrics systems.
 
 ## 11. Table Maintenance Operations
 
