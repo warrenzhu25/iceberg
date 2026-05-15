@@ -116,6 +116,77 @@ The contract for `commit` is stricter than it first appears. Implementations mus
 
 `BaseMetastoreTableOperations` shows the common metastore-backed pattern. It caches `currentMetadata`, `currentMetadataLocation`, a metadata `version`, and a `shouldRefresh` flag. `current()` refreshes if needed. `commit(base, metadata)` rejects stale metadata, returns early for no-op commits, calls backend-specific `doCommit`, deletes removed metadata files, and marks the table for refresh. Subclasses provide `doRefresh()` and `doCommit()`.
 
+## 4.2 Delete Files and Row-Level Operations
+
+Iceberg V2 introduced delete files to support row-level deletes without rewriting data files. V3 adds deletion vectors (DVs) as a more efficient alternative to position deletes.
+
+### Delete File Types
+
+There are three types of delete files:
+
+1. **Position Deletes**: Record file path + row position pairs. Applied by filtering out matching positions during scan.
+2. **Equality Deletes**: Record column values that identify deleted rows. Applied by filtering rows matching the equality predicates.
+3. **Deletion Vectors (V3)**: Compact bitmap representation of deleted positions within a single data file. Stored inline or as Puffin blobs.
+
+Position deletes are cheaper to write but require the reader to know the exact file and position. Equality deletes are more expensive to apply but work without knowing positions.
+
+### RowDelta API
+
+`RowDelta` (`api/src/main/java/org/apache/iceberg/RowDelta.java`) is the primary API for row-level changes. It extends `SnapshotUpdate` and supports:
+
+- `addRows(DataFile)`: Add a data file containing inserted rows.
+- `addDeletes(DeleteFile)`: Add a delete file (position, equality, or DV).
+- `removeRows(DataFile)`: Remove a data file (typically after merge-on-read compaction).
+- `removeDeletes(DeleteFile)`: Remove a delete file that has been compacted away.
+
+Validation methods ensure correctness for concurrent operations:
+
+- `validateFromSnapshot(snapshotId)`: Set the snapshot ID that validations check against.
+- `validateDataFilesExist(paths)`: Ensure referenced data files haven't been removed.
+- `validateNoConflictingDataFiles()`: Ensure no concurrent data file additions conflict.
+- `validateNoConflictingDeleteFiles()`: Ensure no concurrent delete file additions conflict (required for UPDATE/MERGE).
+- `conflictDetectionFilter(expr)`: Scope conflict detection to rows matching the expression.
+
+### Delete Application During Scan
+
+When scanning a table with delete files:
+
+1. `DeleteLoader` loads delete files relevant to each data file based on file path and sequence number.
+2. For position deletes, `PositionDeleteIndex` (bitmap-based) tracks deleted positions.
+3. For equality deletes, `StructLikeSet` holds the delete keys.
+4. The reader applies deletes by checking each row against the delete index.
+
+```mermaid
+flowchart TD
+  DataFile[Data File] --> Reader[File Reader]
+  DeleteFiles[Delete Files for this data file] --> DeleteLoader[DeleteLoader]
+  DeleteLoader --> PosIndex[PositionDeleteIndex]
+  DeleteLoader --> EqSet[Equality Delete Set]
+  Reader --> Filter{Row deleted?}
+  PosIndex --> Filter
+  EqSet --> Filter
+  Filter -->|No| Output[Output Row]
+  Filter -->|Yes| Skip[Skip Row]
+```
+
+Key implementation files:
+
+- `api/src/main/java/org/apache/iceberg/RowDelta.java`: Public API.
+- `core/src/main/java/org/apache/iceberg/BaseRowDelta.java`: Implementation extending `MergingSnapshotProducer`.
+- `core/src/main/java/org/apache/iceberg/deletes/Deletes.java`: Utility methods for building delete indexes and filtering.
+- `core/src/main/java/org/apache/iceberg/deletes/PositionDeleteIndex.java`: Interface for position delete tracking.
+- `core/src/main/java/org/apache/iceberg/deletes/BitmapPositionDeleteIndex.java`: Roaring bitmap implementation.
+
+### Sequence Numbers and Delete Ordering
+
+V2 introduced sequence numbers to order writes. A delete file only applies to data files with a lower sequence number. This allows:
+
+- Concurrent writes without coordination.
+- Correct ordering when delete files are written after data files.
+- Late-arriving deletes that apply to older data.
+
+The sequence number is assigned at commit time and stored in the manifest entry.
+
 ## 5. Deep Dive By Major Module
 
 ### `api`
@@ -403,6 +474,114 @@ Most table-modifying operations eventually produce `MetadataUpdate` entries. Tho
 
 Branch handling is built into `SnapshotProducer`. The default target is `main`. `toBranch` changes the target branch, and `stageOnly` adds the snapshot without advancing the branch head. Write-audit-publish in Spark uses this staged snapshot behavior.
 
+## 7.1 Branching and Tagging
+
+Iceberg supports named references to snapshots through branches and tags. This enables workflows like write-audit-publish (WAP), isolated development branches, and point-in-time recovery.
+
+### SnapshotRef Structure
+
+`SnapshotRef` (`api/src/main/java/org/apache/iceberg/SnapshotRef.java`) represents a named reference to a snapshot:
+
+```java
+public class SnapshotRef {
+  private final long snapshotId;          // The snapshot this ref points to
+  private final SnapshotRefType type;     // BRANCH or TAG
+  private final Integer minSnapshotsToKeep; // Branch retention: minimum snapshots
+  private final Long maxSnapshotAgeMs;    // Branch retention: max age
+  private final Long maxRefAgeMs;         // Reference retention: when to expire the ref itself
+}
+```
+
+**Branches** are mutable pointers that advance as new snapshots are committed. They support retention policies for automatic snapshot expiration.
+
+**Tags** are immutable pointers to a specific snapshot. They do not advance and cannot have snapshot retention properties (only ref age).
+
+The `main` branch (`SnapshotRef.MAIN_BRANCH`) is the default branch. All tables have a `main` branch that points to the current snapshot.
+
+### ManageSnapshots API
+
+`ManageSnapshots` (`api/src/main/java/org/apache/iceberg/ManageSnapshots.java`) provides the API for managing refs:
+
+```java
+// Create refs
+table.manageSnapshots()
+    .createBranch("audit-branch", snapshotId)
+    .createTag("release-v1", snapshotId)
+    .commit();
+
+// Modify refs
+table.manageSnapshots()
+    .replaceBranch("main", "audit-branch")  // Fast-forward main to audit-branch
+    .setMinSnapshotsToKeep("main", 10)
+    .setMaxSnapshotAgeMs("main", 7 * 24 * 60 * 60 * 1000L)  // 7 days
+    .commit();
+
+// Remove refs
+table.manageSnapshots()
+    .removeBranch("old-branch")
+    .removeTag("old-tag")
+    .commit();
+```
+
+Key operations:
+
+- `createBranch(name)` / `createBranch(name, snapshotId)`: Create a new branch.
+- `createTag(name, snapshotId)`: Create a new tag.
+- `removeBranch(name)` / `removeTag(name)`: Remove a ref.
+- `replaceBranch(from, to)`: Point branch `from` to the same snapshot as `to`.
+- `fastForwardBranch(from, to)`: Fast-forward `from` to `to` (requires `from` is ancestor).
+- `cherrypick(snapshotId)`: Apply changes from a staged snapshot to the current branch.
+
+### Write-Audit-Publish (WAP) Pattern
+
+WAP allows writing data to a staged snapshot that is not visible until audited and published:
+
+```mermaid
+sequenceDiagram
+  participant Writer
+  participant Table
+  participant Auditor
+
+  Writer->>Table: newAppend().toBranch("audit").stageOnly().commit()
+  Note right of Table: Creates staged snapshot on audit branch
+  Auditor->>Table: Read from audit branch
+  Auditor->>Auditor: Validate data quality
+  Auditor->>Table: manageSnapshots().cherrypick(stagedId).commit()
+  Note right of Table: Publishes staged snapshot to main
+```
+
+The workflow:
+
+1. Write data with `stageOnly()` to create an orphan snapshot.
+2. Use `toBranch("wap-branch")` to write to a non-main branch.
+3. Audit the staged data by reading from that branch.
+4. Use `cherrypick(snapshotId)` to publish the staged snapshot to `main`.
+
+### Time Travel with Refs
+
+Scans can target specific refs:
+
+```java
+// Read from a branch
+table.newScan().useRef("feature-branch").planFiles();
+
+// Read from a tag
+table.newScan().useRef("release-v1").planFiles();
+
+// Read from a specific snapshot
+table.newScan().useSnapshot(snapshotId).planFiles();
+
+// Read as of a timestamp
+table.newScan().asOfTime(timestampMillis).planFiles();
+```
+
+Key implementation files:
+
+- `api/src/main/java/org/apache/iceberg/SnapshotRef.java`: Ref model.
+- `api/src/main/java/org/apache/iceberg/ManageSnapshots.java`: Public API.
+- `core/src/main/java/org/apache/iceberg/SnapshotManager.java`: Implementation.
+- `core/src/main/java/org/apache/iceberg/TableMetadata.java`: Stores refs map.
+
 ## 8. Engine Integration Strategy
 
 Engine modules are adapters, not owners of table semantics. They translate engine-specific APIs into Iceberg table operations.
@@ -503,7 +682,334 @@ Testing is distributed by module. The root README notes Docker/Testcontainers re
 
 Generated or bundled artifacts include runtime/bundle modules for dependency shading, OpenAPI-generated or OpenAPI-related artifacts, and version-specific engine runtime jars.
 
-## 11. Risks, Complexity, and Onboarding Traps
+## 11. Table Maintenance Operations
+
+Iceberg tables require periodic maintenance to optimize performance and manage storage. Maintenance operations are implemented as `Action` interfaces in `api/src/main/java/org/apache/iceberg/actions/`.
+
+### Compaction (RewriteDataFiles)
+
+`RewriteDataFiles` optimizes data file layout by rewriting files to improve query performance.
+
+```java
+Actions.forTable(table)
+    .rewriteDataFiles()
+    .filter(Expressions.equal("date", "2024-01-15"))
+    .option(RewriteDataFiles.TARGET_FILE_SIZE_BYTES, "134217728")  // 128MB
+    .option(RewriteDataFiles.MAX_CONCURRENT_FILE_GROUP_REWRITES, "5")
+    .execute();
+```
+
+Strategies:
+
+- **binPack()**: Combine small files into larger ones without sorting. Fastest, least resource-intensive.
+- **sort()**: Rewrite files sorted by the table's sort order. Improves query performance for range scans.
+- **sort(SortOrder)**: Rewrite with a custom sort order.
+- **zOrder(columns...)**: Apply Z-ordering for multi-dimensional clustering. Good for queries filtering on multiple columns.
+
+Key options:
+
+- `TARGET_FILE_SIZE_BYTES`: Target size for output files.
+- `MAX_FILE_GROUP_SIZE_BYTES`: Maximum bytes per rewrite group (default 100GB).
+- `MAX_CONCURRENT_FILE_GROUP_REWRITES`: Parallelism for rewrite operations.
+- `PARTIAL_PROGRESS_ENABLED`: Commit groups as they complete (allows progress on failures).
+- `USE_STARTING_SEQUENCE_NUMBER`: Use the starting snapshot's sequence number to avoid conflicts with concurrent equality deletes.
+
+Implementation: `api/src/main/java/org/apache/iceberg/actions/RewriteDataFiles.java`
+
+### Expire Snapshots
+
+`ExpireSnapshots` removes old snapshots and their orphaned data files.
+
+```java
+Actions.forTable(table)
+    .expireSnapshots()
+    .expireOlderThan(System.currentTimeMillis() - 7 * 24 * 60 * 60 * 1000L)  // 7 days
+    .retainLast(10)
+    .execute();
+```
+
+This operation:
+
+1. Identifies snapshots older than the threshold (excluding the last N retained).
+2. Removes manifest list files for expired snapshots.
+3. Removes manifest files no longer referenced by any valid snapshot.
+4. Removes data and delete files no longer referenced by any valid manifest.
+
+Implementation: `api/src/main/java/org/apache/iceberg/actions/ExpireSnapshots.java`
+
+### Delete Orphan Files
+
+`DeleteOrphanFiles` removes files in the table location that are not referenced by any metadata.
+
+```java
+Actions.forTable(table)
+    .deleteOrphanFiles()
+    .olderThan(System.currentTimeMillis() - 3 * 24 * 60 * 60 * 1000L)  // 3 days
+    .execute();
+```
+
+Orphan files can occur from:
+
+- Failed writes that created files but didn't commit.
+- Expired snapshots (if not cleaned up properly).
+- Manual file additions that were never committed.
+
+**Warning**: This operation lists the entire table location, which can be expensive for large tables.
+
+Implementation: `api/src/main/java/org/apache/iceberg/actions/DeleteOrphanFiles.java`
+
+### Rewrite Manifests
+
+`RewriteManifests` optimizes manifest files for better scan planning.
+
+```java
+Actions.forTable(table)
+    .rewriteManifests()
+    .rewriteIf(manifest -> manifest.length() < 8 * 1024 * 1024)  // Rewrite manifests < 8MB
+    .execute();
+```
+
+Benefits:
+
+- Combines small manifests into larger ones.
+- Improves scan planning performance by reducing manifest count.
+- Can reorder manifest entries for better pruning.
+
+Implementation: `api/src/main/java/org/apache/iceberg/actions/RewriteManifests.java`
+
+### Maintenance in Spark
+
+Spark provides SQL procedures for maintenance:
+
+```sql
+-- Compaction
+CALL catalog.system.rewrite_data_files('db.table');
+CALL catalog.system.rewrite_data_files(table => 'db.table', strategy => 'sort');
+
+-- Expire snapshots
+CALL catalog.system.expire_snapshots('db.table', TIMESTAMP '2024-01-01 00:00:00');
+
+-- Remove orphan files
+CALL catalog.system.remove_orphan_files('db.table');
+
+-- Rewrite manifests
+CALL catalog.system.rewrite_manifests('db.table');
+```
+
+Procedure implementations: `spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/procedures/`
+
+### Maintenance in Flink
+
+Flink provides maintenance operators for streaming tables:
+
+- `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/maintenance/`: Maintenance job framework.
+- Operators for expire snapshots, orphan file cleanup, and data file compaction.
+- Can run as periodic batch jobs or as part of a streaming topology.
+
+### Maintenance Scheduling Best Practices
+
+1. **Expire snapshots**: Run frequently (hourly or daily) to prevent metadata bloat.
+2. **Delete orphan files**: Run less frequently (weekly) due to high cost of listing.
+3. **Compaction**: Run based on file count/size thresholds, not just time.
+4. **Rewrite manifests**: Run when manifest count exceeds threshold (e.g., 100+).
+
+## 12. Partition Evolution
+
+Iceberg supports partition evolution: changing the partition scheme of a table without rewriting existing data. Multiple `PartitionSpec` versions can coexist, and Iceberg handles them correctly during scan planning.
+
+### How Multiple PartitionSpecs Coexist
+
+Each `PartitionSpec` has a unique `specId`. Data files are written with a specific spec ID, and that spec is stored with the file's manifest entry. When scanning:
+
+1. The scan planner loads all manifests from the target snapshot.
+2. Each manifest entry records which spec ID was used to partition that file.
+3. The planner applies partition pruning using the file's actual partition values, regardless of the current spec.
+
+This means:
+
+- Old data files remain readable with their original partition layout.
+- New data files use the current partition spec.
+- Queries work correctly across partition scheme changes.
+
+### UpdatePartitionSpec API
+
+`UpdatePartitionSpec` (`api/src/main/java/org/apache/iceberg/UpdatePartitionSpec.java`) modifies the partition spec:
+
+```java
+table.updateSpec()
+    .addField("event_date")                    // Add identity partition on event_date
+    .addField(Expressions.bucket("user_id", 16))  // Add bucket partition
+    .removeField("old_partition_field")        // Remove a partition field
+    .renameField("date", "event_date")         // Rename a partition field
+    .commit();
+```
+
+Key methods:
+
+- `addField(sourceName)`: Add identity transform on a source column.
+- `addField(Term)`: Add a transformed partition field (bucket, truncate, year, month, day, hour).
+- `addField(name, Term)`: Add with explicit partition field name.
+- `removeField(name)`: Remove a partition field.
+- `renameField(name, newName)`: Rename a partition field.
+
+### Void Transforms for Removed Fields
+
+When a partition field is removed, it is replaced with a **void transform** rather than being deleted from the spec. This preserves the field ID and allows existing data files to remain valid.
+
+The void transform always returns `null` for any input, effectively making the field non-partitioned for new writes while maintaining compatibility with old files.
+
+### Scan Planning with Multiple Specs
+
+During scan planning, partition pruning works across specs:
+
+1. If a filter references a partition field that exists in all specs, pruning applies normally.
+2. If a filter references a partition field that only exists in some specs, only those specs' files can be pruned.
+3. Files with the void transform cannot be pruned on that field.
+
+Key implementation files:
+
+- `api/src/main/java/org/apache/iceberg/UpdatePartitionSpec.java`: Public API.
+- `core/src/main/java/org/apache/iceberg/BaseUpdatePartitionSpec.java`: Implementation.
+- `api/src/main/java/org/apache/iceberg/transforms/`: Transform implementations.
+
+## 13. Statistics and Puffin Files
+
+Iceberg stores optional statistics about table data to improve query planning. Puffin is Iceberg's format for storing statistics blobs.
+
+### Puffin Format Structure
+
+Puffin files (`core/src/main/java/org/apache/iceberg/puffin/`) store arbitrary binary blobs with metadata:
+
+```
++------------------+
+| Magic (PUFFIN)   |
++------------------+
+| Blob 1           |
++------------------+
+| Blob 2           |
++------------------+
+| ...              |
++------------------+
+| Footer           |
+| - Blob metadata  |
+| - Properties     |
++------------------+
+| Footer size      |
++------------------+
+| Magic (PUFFIN)   |
++------------------+
+```
+
+Each blob has:
+
+- Type identifier (e.g., `apache-datasketches-theta-v1` for NDV sketches).
+- Compression codec (none, zstd, lz4).
+- Snapshot ID the statistics were computed from.
+- Sequence number.
+- Field IDs the statistics apply to.
+
+### Standard Blob Types
+
+Common statistics stored in Puffin files:
+
+- **NDV sketches**: Approximate distinct value counts using Apache DataSketches Theta sketches.
+- **Deletion vectors**: Compact representation of deleted positions (V3).
+- **Partition statistics**: Statistics aggregated by partition.
+
+### Statistics APIs
+
+`UpdateStatistics` manages table-level statistics:
+
+```java
+table.updateStatistics()
+    .setStatistics(snapshotId, statisticsFile)
+    .commit();
+```
+
+`UpdatePartitionStatistics` manages partition-level statistics:
+
+```java
+table.updatePartitionStatistics()
+    .setPartitionStatistics(partitionStatisticsFile)
+    .commit();
+```
+
+### Computing Statistics in Spark
+
+Spark provides procedures and actions for computing statistics:
+
+```sql
+-- Compute column statistics
+CALL catalog.system.compute_table_stats('db.table');
+```
+
+The `ComputeTableStats` action computes NDV sketches and writes them to Puffin files.
+
+Key implementation files:
+
+- `core/src/main/java/org/apache/iceberg/puffin/Puffin.java`: Entry point for reading/writing.
+- `core/src/main/java/org/apache/iceberg/puffin/PuffinReader.java`: Reader implementation.
+- `core/src/main/java/org/apache/iceberg/puffin/PuffinWriter.java`: Writer implementation.
+- `api/src/main/java/org/apache/iceberg/StatisticsFile.java`: Statistics file metadata.
+
+## 14. View Support
+
+Iceberg supports views as first-class objects alongside tables. Views store SQL definitions with schema information.
+
+### View Interface
+
+`View` (`api/src/main/java/org/apache/iceberg/view/View.java`) represents a logical view:
+
+```java
+public interface View {
+  String name();
+  Schema schema();                      // Output schema of the view
+  Map<Integer, Schema> schemas();       // All schema versions
+  ViewVersion currentVersion();         // Current view definition
+  Iterable<ViewVersion> versions();     // All version history
+  List<ViewHistoryEntry> history();     // Version history entries
+  Map<String, String> properties();     // View properties
+  SQLViewRepresentation sqlFor(String dialect);  // Get SQL for a dialect
+}
+```
+
+### View Versions and SQL Representations
+
+A `ViewVersion` captures a specific view definition:
+
+- Default catalog and namespace context.
+- Schema for the view output.
+- Summary metadata.
+- One or more `ViewRepresentation` objects (SQL for different dialects).
+
+Views support multiple SQL representations to handle dialect differences:
+
+```java
+view.sqlFor("spark");    // Returns Spark SQL representation
+view.sqlFor("trino");    // Returns Trino SQL representation
+view.sqlFor("default");  // Returns default SQL representation
+```
+
+### Catalog View Operations
+
+`ViewCatalog` extends catalog functionality for views:
+
+```java
+ViewCatalog catalog = ...;
+catalog.createView(identifier, schema, sql, properties);
+catalog.loadView(identifier);
+catalog.dropView(identifier);
+catalog.renameView(from, to);
+```
+
+Key implementation files:
+
+- `api/src/main/java/org/apache/iceberg/view/View.java`: View interface.
+- `api/src/main/java/org/apache/iceberg/view/ViewVersion.java`: Version definition.
+- `api/src/main/java/org/apache/iceberg/view/ViewRepresentation.java`: SQL representation.
+- `api/src/main/java/org/apache/iceberg/catalog/ViewCatalog.java`: Catalog interface.
+
+## 15. Risks, Complexity, and Onboarding Traps
 
 `core` is dense because it mixes table semantics, metadata formats, scan planning, catalog behavior, REST client logic, and IO utilities. Start from a specific flow instead of reading it alphabetically.
 
@@ -517,7 +1023,7 @@ Commit behavior is backend-sensitive. Do not assume all catalogs publish metadat
 
 File IO and file format code should not casually depend on engine-specific classes. Engine adapters should sit at the edge and translate into Iceberg abstractions.
 
-## 12. Suggested Reading Path
+## 16. Suggested Reading Path
 
 ### 30-minute orientation
 
@@ -546,10 +1052,135 @@ File IO and file format code should not casually depend on engine-specific class
 5. Read one catalog backend in depth: REST, Hive metastore, Nessie, or JDBC.
 6. Review cloud `FileIO` implementations if your work touches storage behavior.
 
-## 13. Open Questions For Deeper Investigation
+### How to Trace Code Paths
+
+When debugging or understanding Iceberg behavior, these entry points help navigate the codebase:
+
+**Scan Planning**:
+1. Start at `Table.newScan()` → `BaseTable.newScan()`.
+2. Trace through `DataTableScan` → `SnapshotScan.planFiles()`.
+3. For delete application, look at `DeleteLoader` and classes in `core/src/main/java/org/apache/iceberg/deletes/`.
+
+**Commit Flow**:
+1. Start at the update API (e.g., `Table.newAppend()`).
+2. Trace through `SnapshotProducer.commit()` for the retry loop.
+3. Look at `apply()` for manifest generation and `validate()` for conflict detection.
+4. Follow `TableOperations.commit()` for backend-specific commit logic.
+
+**Delete Application**:
+1. Find `FileScanTask` construction in the scan planner.
+2. Trace `DeleteLoader` in reader code.
+3. Look at `Deletes.java` utilities for position/equality delete handling.
+
+**Engine-Specific Behavior**:
+When tracing Spark or Flink code, check all version directories:
+```
+spark/v3.4/spark/src/main/java/org/apache/iceberg/spark/...
+spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/...
+spark/v4.0/spark/src/main/java/org/apache/iceberg/spark/...
+```
+
+Common patterns:
+- Spark catalogs: `SparkCatalog.java` in each version.
+- Spark writes: `SparkWrite.java`, `SparkWriteBuilder.java`.
+- Flink sinks: `FlinkSink.java`, `IcebergFilesCommitter.java`.
+
+**Finding Where Behavior is Defined**:
+1. Check `format/spec.md` for specification-level behavior.
+2. Check API interfaces in `api/src/main/java/org/apache/iceberg/`.
+3. Check core implementations for default behavior.
+4. Check engine modules for engine-specific overrides.
+
+### Testing Patterns
+
+**Test Base Classes**:
+- `core/src/test/java/org/apache/iceberg/TestBase.java`: Base for core tests with table setup utilities.
+- Engine-specific bases in each versioned module.
+
+**Creating Test Files**:
+```java
+// Using TestTables for in-memory testing
+TestTables.create(tableDir, "test", schema, spec, formatVersion);
+
+// Using DataFiles builder
+DataFiles.builder(spec)
+    .withPath("/path/to/file.parquet")
+    .withFileSizeInBytes(1024)
+    .withRecordCount(100)
+    .build();
+```
+
+**Catalog Compliance Tests**:
+`core/src/test/java/org/apache/iceberg/catalog/CatalogTests.java` provides a test suite that any catalog implementation should pass.
+
+**Running Tests by Module**:
+```bash
+# Core tests
+./gradlew :iceberg-core:test
+
+# Spark 3.5 tests
+./gradlew :iceberg-spark-3.5:test
+
+# Specific test class
+./gradlew :iceberg-core:test --tests "org.apache.iceberg.TestTableMetadata"
+
+# With filtering
+./gradlew :iceberg-core:test --tests "*Snapshot*"
+```
+
+## 17. Open Questions For Deeper Investigation
 
 - Which catalog backend is most relevant for your planned change?
 - Does the change affect public API compatibility or only internal implementation?
 - Does the behavior need to be mirrored across Spark/Flink supported versions?
 - Is the behavior defined in `format/spec.md`, REST catalog spec docs, or only by current implementation?
 - Are there existing compatibility tests or golden metadata files that should be updated?
+
+---
+
+## Appendix A: Format Version Quick Reference
+
+| Feature | V1 | V2 | V3 |
+|---------|:--:|:--:|:--:|
+| Data files | ✓ | ✓ | ✓ |
+| Position delete files | ✗ | ✓ | ✓ |
+| Equality delete files | ✗ | ✓ | ✓ |
+| Deletion vectors (DVs) | ✗ | ✗ | ✓ |
+| Sequence numbers | ✗ | ✓ | ✓ |
+| Row lineage | ✗ | ✗ | ✓ |
+| Default field values | ✗ | ✗ | ✓ |
+| Multi-argument transforms | ✗ | ✗ | ✓ |
+
+**Upgrading**: Tables can be upgraded from V1→V2→V3 using `table.updateProperties().set("format-version", "2").commit()`. Downgrades are not supported.
+
+**Choosing a Version**:
+- V1: Legacy, no row-level deletes.
+- V2: Standard for most production use with UPDATE/DELETE/MERGE support.
+- V3: Latest features including DVs for improved delete performance.
+
+---
+
+## Appendix B: Glossary
+
+| Term | Definition |
+|------|------------|
+| **Catalog** | Service that manages table namespaces and locates table metadata. |
+| **Data File** | Physical file containing table row data (Parquet, ORC, or Avro). |
+| **Delete File** | File marking rows as deleted (position, equality, or DV). |
+| **Deletion Vector (DV)** | Compact bitmap of deleted row positions within a single data file (V3). |
+| **Equality Delete** | Delete file that identifies rows by column values. |
+| **FileIO** | Abstraction for reading/writing files to storage backends. |
+| **Manifest** | Avro file listing data or delete files with their metadata. |
+| **Manifest List** | Avro file listing all manifests for a snapshot. |
+| **Partition Spec** | Definition of how rows are partitioned into files. |
+| **Position Delete** | Delete file that identifies rows by file path and row position. |
+| **Puffin** | Binary format for storing statistics blobs (NDV sketches, DVs). |
+| **Schema** | Column definitions with field IDs and types. |
+| **Sequence Number** | Monotonically increasing number assigned at commit time (V2+). |
+| **Snapshot** | A complete, consistent view of a table at a point in time. |
+| **SnapshotRef** | Named reference to a snapshot (branch or tag). |
+| **Sort Order** | Definition of how data should be sorted within files. |
+| **TableMetadata** | JSON file containing the complete table state. |
+| **TableOperations** | Internal abstraction for loading and committing metadata. |
+| **Transform** | Function applied to source columns for partitioning (identity, bucket, truncate, year, month, day, hour). |
+| **WAP** | Write-Audit-Publish: Pattern for auditing data before making it visible. |
